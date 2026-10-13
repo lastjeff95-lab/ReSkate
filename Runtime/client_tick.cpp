@@ -17,6 +17,7 @@
 #include "Extension/RoadRash/road_rash.h"
 #include "Extension/BoardBreak/board_break.h"
 #include "Extension/Skater/grind_exit_control.h"
+#include "Extension/Skater/skater_safety.h"
 #include "Extension/Skater/camera_observer.h"
 #include "Extension/UI/NativeMenu/native_menu.h"
 #include "Extension/Multiplayer/Hud/native_party.h"
@@ -819,6 +820,7 @@ void update_model(std::uintptr_t client, TickState& frame) {
     dingosdk::road_rash::on_client_tick(client);
     dingosdk::board_break::on_client_tick(client);
     dingosdk::grind_exit_control::on_client_tick(client);
+    dingosdk::skater_safety::on_client_tick(client, r.catalog_level.empty() ? r.last_level : r.catalog_level);
     if (!has_request && now < r.next_model && state == r.previous_state) return;
     r.next_model = now + 500;
     DINGO_PROFILE_ZONE("tick/update_model/world model (500 ms)");

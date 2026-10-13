@@ -1,4 +1,5 @@
 #include "skater_observer.h"
+#include "skater_safety.h"
 #include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
@@ -54,13 +55,16 @@ void create_hook(std::uintptr_t component, std::uint8_t ground_check) {
     const auto incoming_error = GetLastError();
     auto& o = observer();
     const auto id = ++o.counts[CreateEntered];
+    // The respawn loop breaker may give a rebuild the game's ground check (skater_safety.h).
+    const auto given = skater_safety::creation_ground_check(component, ground_check);
     static LifecycleLogGate gate;
     const bool report = gate.admit(logging::Channel::skater, "Skater creation");
     if (report) logging::log(logging::Level::info, logging::Channel::skater,
-        "Skater creation {} entered (component=0x{:x}, ground_check={}).", id, component, ground_check);
+        "Skater creation {} entered (component=0x{:x}, ground_check={}{}).", id, component, given,
+        given != ground_check ? " from the loop breaker; the game asked for 0" : "");
     const auto started = GetTickCount64();
     SetLastError(incoming_error);
-    o.create(component, ground_check);
+    o.create(component, given);
     const auto native_error = GetLastError();
     const auto elapsed = GetTickCount64() - started;
     if (report || elapsed >= 1000) logging::log(elapsed >= 1000 ? logging::Level::warning : logging::Level::info, logging::Channel::skater,

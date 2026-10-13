@@ -2,6 +2,8 @@
 #include "client_source_spawn_internal.h"
 #include "no_bail.h"
 #include "offboard_flight.h"
+#include "skater_safety.h"
+#include "skater_safety_model.h"
 #include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/20260929/engine.h"
@@ -56,7 +58,7 @@ void debug_stop_noclip(InteractiveDebug& debug) noexcept {
     debug.noclip_velocity.valid = false;
     clear_no_bail_flight();
 }
-NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity) {
+NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity, bool check_velocities) {
     overlay::DebugModel skater;
     (void)debug_skater(base, client, skater);
     source_require(skater.skater_identity == entity, "Skater changed; flight stopped.");
@@ -92,9 +94,11 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
         const auto body = i < 9 ? board_parts + i * 0x130 : rig_parts + (i - 8) * 0x130;
         source_require(reader.pointer(body, 0x10) == (i < 9 ? board : rig) && body_writable(i, body),
             "Physics body ownership changed.");
-        const auto velocity = reader.value<std::array<float, 3>>(body, 0x70);
-        for (const auto v : velocity) source_require(std::isfinite(v) && std::abs(v) <= 100000,
-            "Invalid physics velocity.");
+        if (check_velocities) {
+            const auto velocity = reader.value<std::array<float, 3>>(body, 0x70);
+            for (const auto v : velocity) source_require(std::isfinite(v) && std::abs(v) <= 100000,
+                "Invalid physics velocity.");
+        }
         result.parts[i] = body;
     }
     result.board_height = reader.value<float>(board_parts, 0x54);
@@ -138,9 +142,23 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
             for (std::size_t i = first; i < bodies.parts.size(); ++i) {
                 velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
                 flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
+            }
+            // Skater safety (skater_safety.h): no body is left faster than the boost limit.
+            auto delta = boost.velocity;
+            if (!offboard && skater_safety::boost_limits()) {
+                const float share = skater_safety::model::boost_share(std::span(velocities).subspan(first), delta,
+                    skater_safety::model::max_boost_speed);
+                if (share < 1) {
+                    for (auto& component : delta) component *= share;
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                        "Skater safety: {} Boost held to {:.0f} m/s ({:.0f}% of this step's push applied).", up ? "Up" : "Forward",
+                        skater_safety::model::max_boost_speed, share * 100);
+                }
+            }
+            for (std::size_t i = first; i < bodies.parts.size(); ++i) {
                 for (std::size_t axis = 0; axis < 3; ++axis) {
-                    if (offboard && axis == 1) velocities[i][axis] = std::max(velocities[i][axis], boost.velocity[1]);
-                    else velocities[i][axis] += boost.velocity[axis];
+                    if (offboard && axis == 1) velocities[i][axis] = std::max(velocities[i][axis], delta[1]);
+                    else velocities[i][axis] += delta[axis];
                     source_require(std::isfinite(velocities[i][axis]) && std::abs(velocities[i][axis]) <= 100000,
                         "Velocity boost produced an invalid physics velocity.");
                 }
@@ -160,6 +178,8 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     boost.expires = GetTickCount64() + 180;
                     debug.status = "Off-board up velocity added.";
                 }
+            } else if (boost.steps > 1) {
+                --boost.steps; // spread over physics steps: the rest comes on the next ones
             } else {
                 boost.valid = false;
                 ++updates;
@@ -333,7 +353,10 @@ void trainer_push_speed(std::uintptr_t core) noexcept {
         } else if (cruise > 0 && speed >= 1.0f && speed < cruise) {
             change = std::min(cruise_gain, cruise - speed);
         }
-        if (std::abs(change) < 0.005f) return;
+        // Skater safety (skater_safety.h): the push never carries the skater past the boost limit.
+        if (change > 0 && skater_safety::boost_limits())
+            change = std::max(0.0f, std::min(change, skater_safety::model::max_boost_speed - speed));
+        if (!std::isfinite(change) || std::abs(change) < 0.005f) return;
         const float scale = (speed + change) / speed;
         // Like the native velocity writers: XYZ at +70 and the dirty bit 8 at +60.
         for (std::size_t i = 0; i < count; ++i) {
@@ -344,12 +367,51 @@ void trainer_push_speed(std::uintptr_t core) noexcept {
         }
     } catch (...) {}
 }
+// Skater safety's check (skater_safety.h), after the game's own step and the SDK's velocity
+// writers: a body velocity that is not finite or absurd is zeroed before the game acts on it.
+// Not while flying (noclip sets its own speeds) or teleporting (the game moves the skater).
+void safety_check_step(std::uintptr_t core) noexcept {
+    const auto target = skater_safety::physics_target();
+    if (!target.core || target.core != core) return;
+    SourceLastError error;
+    auto& state = source_state();
+    if (!state.initialized.load(std::memory_order_acquire) || state.busy.test_and_set(std::memory_order_acquire)) return;
+    SourceBusyScope scope{state.busy};
+    static ULONGLONG after_teleport{}; // physics thread only
+    try {
+        if (state.trial.debug.noclip) return;
+        SourceReader reader;
+        if (reader.value<std::uint8_t>(target.entity, 0x7e0)) after_teleport = GetTickCount64() + 1000;
+        if (GetTickCount64() < after_teleport) return;
+        const auto bodies = debug_noclip_bodies(state.trial.base, target.client, target.entity, false);
+        if (bodies.core != core) return;
+        std::array<skater_safety::model::Vec3, 32> velocities{};
+        std::array<std::uint32_t, 32> flags{};
+        for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
+            velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
+            flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
+        }
+        reader.verify();
+        const auto check = skater_safety::model::check_bodies(velocities);
+        if (skater_safety::model::sane(check)) {
+            skater_safety::report_physics(check.fastest, false, true);
+            return;
+        }
+        // Like the native velocity writers: XYZ at +70 and the dirty bit 8 at +60.
+        for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
+            body_write(bodies.parts[i] + 0x70, std::array<float, 3>{});
+            body_write(bodies.parts[i] + 0x60, flags[i] | 8u);
+        }
+        skater_safety::report_physics(check.fastest, true, check.finite);
+    } catch (...) {}
+}
 void noclip_physics_update(std::uintptr_t core) {
     const auto original = source_state().velocity_update_original.load(std::memory_order_acquire);
     if (original) original(core);
     noclip_apply_velocity(core);
     trainer_apply_jump_scale(core);
     trainer_push_speed(core);
+    safety_check_step(core);
 }
 bool noclip_motion_target(std::uintptr_t rig, std::uintptr_t context,
     const std::array<float,16>* supplied, std::array<float,16>& target) noexcept {

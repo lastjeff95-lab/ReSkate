@@ -132,6 +132,8 @@ struct InteractiveDebug {
         std::array<float, 3> velocity{};
         bool valid{};
         bool applied{};
+        // Physics steps still to add `velocity` on (skater_safety.h spreads a boost); 1: just once.
+        std::uint8_t steps{1};
     } noclip_velocity;
     VelocityRequest forward_velocity;
     VelocityRequest up_velocity;
@@ -218,10 +220,15 @@ SourceCameraSnapshot source_camera_snapshot(const SourceTrial& trial, std::uintp
 std::array<float, 16> debug_view_matrix(const SourceTrial& trial, const SourceCameraSnapshot& camera);
 // client_debug.cpp
 double source_flight_now();
-std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model);
+// `bound_entity`, when given, is set once the player-bound skater entity is verified, so a caller
+// can tell a skater whose transform is broken from no skater at all.
+std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model,
+    std::uintptr_t* bound_entity = nullptr);
 // client_noclip.cpp
 void debug_stop_noclip(InteractiveDebug& debug) noexcept;
-NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity);
+// `check_velocities` false: bodies whose velocity is broken are returned too (skater_safety.h).
+NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity,
+    bool check_velocities = true);
 // client_first_person.cpp
 FirstPersonArm& first_person_arm();
 void first_person_disarm() noexcept;

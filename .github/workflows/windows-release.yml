@@ -53,10 +53,10 @@ jobs:
         run: >
           cmake --build --preset release --parallel 4
           --target dingosdk_launcher dingosdk_runtime
-          dingosdk_velocity_boost_tests
+          dingosdk_velocity_boost_tests dingosdk_skater_safety_tests
 
       - name: Test
-        run: ctest --test-dir build/vs2022-x64 -C Release --output-on-failure -R velocity_boost
+        run: ctest --test-dir build/vs2022-x64 -C Release --output-on-failure -R "velocity_boost|skater_safety"
 
       - name: Collect files
         shell: pwsh

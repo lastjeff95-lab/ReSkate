@@ -138,6 +138,8 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/no_bail.cpp
     Extension/Skater/grind_exit_commands.cpp
     Extension/Skater/grind_exit_control.cpp
+    Extension/Skater/skater_safety.cpp
+    Extension/Skater/skater_safety_commands.cpp
     Extension/Skater/physics_tuning.cpp
     Extension/Multiplayer/Remote/remote_collision.cpp
     Extension/Skater/physics_tuning_model.cpp

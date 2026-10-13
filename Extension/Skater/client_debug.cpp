@@ -2,6 +2,8 @@
 #include "client_source_spawn_internal.h"
 #include "no_bail.h"
 #include "offboard_flight.h"
+#include "skater_safety.h"
+#include "skater_safety_model.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/launcher_support.h"
 #include "Engine/Game/Build/20260929/engine.h"
@@ -63,7 +65,8 @@ std::array<float, 3> debug_position(SourceReader& reader, std::uintptr_t address
     return {row[0], row[1], row[2]};
 }
 }
-std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model) {
+std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model,
+    std::uintptr_t* bound_entity) {
     SourceReader reader;
     source_require(reader.pointer(client) == base + addr::engine::client_vtable, "Client changed.");
     const auto context = reader.pointer(client, 8);
@@ -80,6 +83,7 @@ std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, o
     source_require(reader.pointer(entity) == base + addr::engine::skater_entity_vtable && reader.pointer(entity, 0x20) == context &&
         reader.pointer(entity, 0xf8) == player && reader.pointer(handle) == entity + 8,
         "No verified player-bound skater.");
+    if (bound_entity) *bound_entity = entity;
     const auto collection = reader.pointer(entity, 0x70);
     source_require(reader.pointer(collection) == entity, "Skater transform owner changed.");
     const auto count = reader.value<std::uint8_t>(collection, 8);
@@ -585,7 +589,17 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
             boost.expires = GetTickCount64() + 180;
             ++debug.offboard_up_velocity_updates;
             debug.status = "Off-board up velocity added.";
-        } else debug.status = up ? "Up Boost queued." : "Forward Boost queued.";
+        } else {
+            // Skater safety (skater_safety.h): over a few physics steps, not one impulse.
+            if (skater_safety::boost_limits()) {
+                boost.steps = static_cast<std::uint8_t>(skater_safety::model::boost_steps);
+                for (auto& component : boost.velocity) component /= static_cast<float>(boost.steps);
+                logging::log(logging::Level::info, logging::Channel::skater,
+                    "Skater safety: {} Boost of {:.1f} m/s spread over {} physics steps, every body held to {:.0f} m/s.",
+                    up ? "Up" : "Forward", speed, boost.steps, skater_safety::model::max_boost_speed);
+            }
+            debug.status = up ? "Up Boost queued." : "Forward Boost queued.";
+        }
         return;
     }
     if (request.action == overlay::DebugAction::set_no_bail) {

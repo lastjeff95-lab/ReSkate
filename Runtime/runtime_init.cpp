@@ -28,6 +28,7 @@
 #include "Extension/RoadRash/road_rash.h"
 #include "Extension/BoardBreak/board_break.h"
 #include "Extension/Skater/grind_exit_control.h"
+#include "Extension/Skater/skater_safety.h"
 #include "Extension/Skater/camera_observer.h"
 #include "Extension/Progression/entitlement_request_hook.h"
 #include "Extension/Skater/skater_observer.h"
@@ -442,6 +443,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI DingoSDKDebugInitialize() {
         record("{\"event\":\"grind_exit_control_initialized\",\"active\":" + std::string(grind_control ? "true" : "false") + "}");
         const bool noclip_velocity = dingosdk::start_client_noclip_velocity(r.base);
         record("{\"event\":\"noclip_velocity_initialized\",\"active\":" + std::string(noclip_velocity ? "true" : "false") + "}");
+        const bool safety_ready = dingosdk::skater_safety::start(r.base);
+        record("{\"event\":\"skater_safety_initialized\",\"active\":" + std::string(safety_ready ? "true" : "false") + "}");
         const bool loading_screens = dingosdk::loading_screen::start(r.base);
         record("{\"event\":\"map_loading_screens_initialized\",\"active\":" + std::string(loading_screens ? "true" : "false") + "}");
         const bool preset_guard = dingosdk::preset_lookup_guard::start(r.base);
