@@ -127,7 +127,7 @@ int main() {
         check(s2.settle(base + 5600, base + 2500) && !s2.looping(skater), "A skater that stayed did not end the loop");
         // A loop the game stopped feeding ends on its own.
         LoopDetector quiet;
-        for (std::uint64_t t = 0; t < 4 * 533; t += 533) (void)quiet.creation(skater, t);
+        for (std::uint64_t t = 0; t < 4u * 533u; t += 533u) (void)quiet.creation(skater, t);
         check(quiet.looping(skater), "533 ms retries were not a loop");
         check(!quiet.settle(5000, 0), "The loop ended while the game was still retrying");
         check(quiet.settle(1599 + quiet_ms, 0), "A loop the game stopped feeding did not end");
