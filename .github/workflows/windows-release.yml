@@ -1,0 +1,84 @@
+# Release build of ReSkateLauncher.exe and ReSkate.dll for this fork.
+#
+# Built like a local build (README "Building from source"): DINGOSDK_LAUNCHER_AUTO_UPDATE is OFF,
+# so the launcher only reports a newer official release and never replaces these files.
+# Crash uploads are off (DINGOSDK_CRASH_REPORT_URL empty) so a modified build does not send
+# minidumps to the upstream project's Sentry server.
+name: Windows Release
+
+on:
+  push:
+    branches: [mac-crossover-fixes]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # The vs2022-x64 preset uses the "Visual Studio 17 2022" generator and the v143 toolset.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (Spotify device helper)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            SpotifyHelper/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('SpotifyHelper/Cargo.lock') }}
+
+      # cmake/Runtime.cmake links the Rust helper when cargo is found and globs the
+      # windows_x86_64_msvc import library from the cargo registry at configure time, so the
+      # crates must be on disk before CMake configures.
+      - name: Build Spotify device helper
+        working-directory: SpotifyHelper
+        run: cargo build --release --lib --locked
+
+      - name: Configure
+        run: >
+          cmake --preset vs2022-x64
+          -DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF
+          -DDINGOSDK_CRASH_REPORT_URL=
+          -DDINGOSDK_BUILD_MULTIPLAYER_TESTS=ON
+
+      - name: Build
+        run: >
+          cmake --build --preset release --parallel 4
+          --target dingosdk_launcher dingosdk_runtime
+          dingosdk_velocity_boost_tests
+
+      - name: Test
+        run: ctest --test-dir build/vs2022-x64 -C Release --output-on-failure -R velocity_boost
+
+      - name: Collect files
+        shell: pwsh
+        run: |
+          $out = "artifact"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $release = "build/vs2022-x64/Release"
+          foreach ($name in "ReSkate.dll", "ReSkateLauncher.exe", "ReSkate.pdb", "ReSkateLauncher.pdb") {
+            if (Test-Path "$release/$name") { Copy-Item "$release/$name" $out }
+          }
+          if (-not (Test-Path "$out/ReSkate.dll") -or -not (Test-Path "$out/ReSkateLauncher.exe")) {
+            throw "Build output is missing ReSkate.dll or ReSkateLauncher.exe"
+          }
+          "commit ${{ github.sha }}`nbranch ${{ github.ref_name }}`nrun ${{ github.run_id }}" | Set-Content "$out/BUILD-INFO.txt"
+          Get-ChildItem $out -File | Where-Object Name -ne "SHA256SUMS.txt" | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content "$out/SHA256SUMS.txt"
+          Get-Content "$out/SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReSkate-${{ github.ref_name }}-${{ github.sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
