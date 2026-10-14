@@ -32,9 +32,16 @@ struct PhysicsTarget {
     std::uintptr_t client{}, entity{}, core{};
 };
 PhysicsTarget physics_target() noexcept;
-// From the physics step check (client_noclip.cpp), every step of that skater: the fastest
-// body, and whether the step's velocities were zeroed (`finite`: they were all finite).
-void report_physics(float fastest, bool zeroed, bool finite) noexcept;
+// From the physics step check (client_noclip.cpp), every step of that skater.
+struct PhysicsReport {
+    float fastest{};      // m/s, of the finite body velocities
+    bool finite{true};    // every body velocity was finite
+    bool zeroed{};        // the step's velocities were zeroed
+    float seconds{};      // the core's physics step length
+    float board_height{}; // the first board body's height
+    int nonfinite_bodies{};
+};
+void report_physics(const PhysicsReport &report) noexcept;
 bool boost_limits() noexcept;
 // The console verb: safety [status] | safety boost|check|loop on|off.
 std::string command(const std::vector<std::string> &words);

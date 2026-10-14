@@ -220,15 +220,23 @@ SourceCameraSnapshot source_camera_snapshot(const SourceTrial& trial, std::uintp
 std::array<float, 16> debug_view_matrix(const SourceTrial& trial, const SourceCameraSnapshot& camera);
 // client_debug.cpp
 double source_flight_now();
-// `bound_entity`, when given, is set once the player-bound skater entity is verified, so a caller
-// can tell a skater whose transform is broken from no skater at all.
+// What debug_skater found before it gave up (skater_safety.h): the player-bound skater entity
+// once verified, and its root transform as read, before any check of it.
+struct SkaterRead {
+    std::uintptr_t entity{};
+    std::array<float, 16> matrix{};
+    bool matrix_read{};
+};
 std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model,
-    std::uintptr_t* bound_entity = nullptr);
+    SkaterRead* found = nullptr);
 // client_noclip.cpp
 void debug_stop_noclip(InteractiveDebug& debug) noexcept;
-// `check_velocities` false: bodies whose velocity is broken are returned too (skater_safety.h).
+// `all`: the skater's transform, body velocities, timestep and board height must be sane.
+// `ownership`: only that the bodies are this entity's; broken values are returned for the caller
+// to judge (skater_safety.h). `root` stays zero then.
+enum class BodyChecks { all, ownership };
 NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity,
-    bool check_velocities = true);
+    BodyChecks checks = BodyChecks::all);
 // client_first_person.cpp
 FirstPersonArm& first_person_arm();
 void first_person_disarm() noexcept;

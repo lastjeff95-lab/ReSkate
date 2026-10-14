@@ -58,11 +58,15 @@ void debug_stop_noclip(InteractiveDebug& debug) noexcept {
     debug.noclip_velocity.valid = false;
     clear_no_bail_flight();
 }
-NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity, bool check_velocities) {
+NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std::uintptr_t entity, BodyChecks checks) {
+    const bool all = checks == BodyChecks::all;
     overlay::DebugModel skater;
-    (void)debug_skater(base, client, skater);
-    source_require(skater.skater_identity == entity, "Skater changed; flight stopped.");
+    if (all) {
+        (void)debug_skater(base, client, skater);
+        source_require(skater.skater_identity == entity, "Skater changed; flight stopped.");
+    }
     SourceReader reader;
+    if (!all) source_require(reader.pointer(entity) == base + addr::engine::skater_entity_vtable, "Skater changed.");
     const auto collection = reader.pointer(entity, 0x70);
     const auto component = reader.pointer(entity, 0x628);
     source_require(reader.pointer(component) == base + addr::engine::skater_component_vtable && reader.pointer(component, 0x18) == collection,
@@ -78,7 +82,7 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
     source_require(reader.pointer(result.rig_wrapper) == result.context && reader.pointer(result.rig_wrapper, 0x4630) == result.core,
         "Skater motion ownership changed.");
     result.seconds = reader.value<float>(result.context, 0x17ec);
-    source_require(std::isfinite(result.seconds) && result.seconds >= 0 && result.seconds <= .1f, "Invalid physics timestep.");
+    source_require(!all || (std::isfinite(result.seconds) && result.seconds >= 0 && result.seconds <= .1f), "Invalid physics timestep.");
     result.offboard = reader.pointer(reader.pointer(result.core, 0x3b0)) == base + addr::offboard_flight::offboard_flight_vtable;
     // Read the committed native state, not the selector's proposed next state
     // (which is remapped by its caller and may be stale between selections).
@@ -94,7 +98,7 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
         const auto body = i < 9 ? board_parts + i * 0x130 : rig_parts + (i - 8) * 0x130;
         source_require(reader.pointer(body, 0x10) == (i < 9 ? board : rig) && body_writable(i, body),
             "Physics body ownership changed.");
-        if (check_velocities) {
+        if (all) {
             const auto velocity = reader.value<std::array<float, 3>>(body, 0x70);
             for (const auto v : velocity) source_require(std::isfinite(v) && std::abs(v) <= 100000,
                 "Invalid physics velocity.");
@@ -102,7 +106,7 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
         result.parts[i] = body;
     }
     result.board_height = reader.value<float>(board_parts, 0x54);
-    source_require(std::isfinite(result.board_height) && std::abs(result.board_height) <= 1000000, "Invalid board altitude.");
+    source_require(!all || (std::isfinite(result.board_height) && std::abs(result.board_height) <= 1000000), "Invalid board altitude.");
     reader.verify();
     return result;
 }
@@ -383,7 +387,8 @@ void safety_check_step(std::uintptr_t core) noexcept {
         SourceReader reader;
         if (reader.value<std::uint8_t>(target.entity, 0x7e0)) after_teleport = GetTickCount64() + 1000;
         if (GetTickCount64() < after_teleport) return;
-        const auto bodies = debug_noclip_bodies(state.trial.base, target.client, target.entity, false);
+        // Ownership only: a skater whose transform or values are already broken is the one to fix.
+        const auto bodies = debug_noclip_bodies(state.trial.base, target.client, target.entity, BodyChecks::ownership);
         if (bodies.core != core) return;
         std::array<skater_safety::model::Vec3, 32> velocities{};
         std::array<std::uint32_t, 32> flags{};
@@ -393,16 +398,17 @@ void safety_check_step(std::uintptr_t core) noexcept {
         }
         reader.verify();
         const auto check = skater_safety::model::check_bodies(velocities);
-        if (skater_safety::model::sane(check)) {
-            skater_safety::report_physics(check.fastest, false, true);
-            return;
+        skater_safety::PhysicsReport report{check.fastest, check.finite, false, bodies.seconds, bodies.board_height};
+        for (const auto& v : velocities) report.nonfinite_bodies += skater_safety::model::finite(v) ? 0 : 1;
+        if (!skater_safety::model::sane(check)) {
+            // Like the native velocity writers: XYZ at +70 and the dirty bit 8 at +60.
+            for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
+                body_write(bodies.parts[i] + 0x70, std::array<float, 3>{});
+                body_write(bodies.parts[i] + 0x60, flags[i] | 8u);
+            }
+            report.zeroed = true;
         }
-        // Like the native velocity writers: XYZ at +70 and the dirty bit 8 at +60.
-        for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
-            body_write(bodies.parts[i] + 0x70, std::array<float, 3>{});
-            body_write(bodies.parts[i] + 0x60, flags[i] | 8u);
-        }
-        skater_safety::report_physics(check.fastest, true, check.finite);
+        skater_safety::report_physics(report);
     } catch (...) {}
 }
 void noclip_physics_update(std::uintptr_t core) {

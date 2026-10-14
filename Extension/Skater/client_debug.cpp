@@ -66,7 +66,7 @@ std::array<float, 3> debug_position(SourceReader& reader, std::uintptr_t address
 }
 }
 std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model,
-    std::uintptr_t* bound_entity) {
+    SkaterRead* found) {
     SourceReader reader;
     source_require(reader.pointer(client) == base + addr::engine::client_vtable, "Client changed.");
     const auto context = reader.pointer(client, 8);
@@ -83,13 +83,14 @@ std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, o
     source_require(reader.pointer(entity) == base + addr::engine::skater_entity_vtable && reader.pointer(entity, 0x20) == context &&
         reader.pointer(entity, 0xf8) == player && reader.pointer(handle) == entity + 8,
         "No verified player-bound skater.");
-    if (bound_entity) *bound_entity = entity;
+    if (found) found->entity = entity;
     const auto collection = reader.pointer(entity, 0x70);
     source_require(reader.pointer(collection) == entity, "Skater transform owner changed.");
     const auto count = reader.value<std::uint8_t>(collection, 8);
     const auto first = reader.value<std::uint8_t>(collection, 9), extra = reader.value<std::uint8_t>(collection, 10);
     source_require(count <= 128 && first <= 128 && extra <= 32, "Skater transform layout changed.");
     const auto offset_matrix = std::uintptr_t{0x10} + (std::uintptr_t{first} + 2 * std::uintptr_t{extra}) * 0x20;
+    if (found) found->matrix_read = reader.raw(collection + offset_matrix, found->matrix.data(), sizeof(found->matrix));
     const auto position = debug_position(reader, collection + offset_matrix + 0x30);
     std::array<float, 16> matrix{};
     source_require(reader.raw(collection + offset_matrix, matrix.data(), sizeof(matrix)) && valid_flight_transform(matrix),

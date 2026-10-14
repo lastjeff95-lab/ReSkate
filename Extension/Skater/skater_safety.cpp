@@ -4,6 +4,7 @@
 #include "skater_safety_model.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/20260929/engine.h"
+#include "Engine/Game/Build/20260929/local_placements.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Multiplayer/session_tools.h"
 #include "Extension/Profile/local_profile_runtime.h"
@@ -15,8 +16,10 @@ namespace {
 namespace detail = client_source::detail;
 using model::Vec3;
 constexpr const char *boost_key = "Safety.BoostLimits", *check_key = "Safety.SkaterCheck", *loop_key = "Safety.LoopBreaker";
-constexpr std::uint64_t rescue_gap_ms = 2000, settle_after_ms = 1000, broken_for_ms = 300;
+constexpr std::uint64_t rescue_gap_ms = 2000, settle_after_ms = 1000, broken_for_ms = 300, stuck_teleport_ms = 3000;
 constexpr int max_rescues = 10; // per map: past that the game is not fought any longer
+// Repeated lines (a loop repeats every 533 ms): the first few per map, then one in this many.
+constexpr int log_first = 5, log_every = 20;
 
 struct Safety {
     std::atomic<std::uintptr_t> base{};
@@ -27,8 +30,10 @@ struct Safety {
     SRWLOCK target_lock = SRWLOCK_INIT;
     PhysicsTarget target;
     std::uint64_t target_until{};
+    std::atomic<bool> looping{}; // a respawn loop is under way: the check runs through creations
     // From the physics step check.
-    std::atomic<float> fastest{};
+    std::atomic<float> fastest{}, seconds{}, board_height{};
+    std::atomic<int> nonfinite_bodies{};
     std::atomic<std::uint64_t> zeroed{}, zeroed_nonfinite{};
     // The latest skater creation of any kind (a spawn, a bail's respawn): the check stands back
     // for `settle_after_ms` after one, while the game places the skater.
@@ -49,13 +54,19 @@ struct Safety {
     std::uint64_t healthy_since{}, seen_zeroed{}, seen_nonfinite{}, next_rescue{};
     std::uint64_t teleport_until{}; // the game's own teleport, and a second after it
     std::uint64_t broken_since{};   // a bound skater whose position is not valid, since then
-    int rescues{};
+    int rescues{}, lost_lines{}, broken_lines{};
+    // The game's teleport manager (the one that respawns the skater): its state, 0 while idle.
+    std::uint32_t teleport_state{};
+    std::uint64_t teleport_busy_since{};
+    bool teleport_dumped{}, teleport_wait_logged{};
+    int teleport_lines{};
 };
 Safety &safety() {
     static auto *value = new Safety;
     return *value;
 }
 const char *on_off(bool on) { return on ? "on" : "off"; }
+bool log_due(int &count) { return ++count <= log_first || count % log_every == 0; }
 
 void load_options(Safety &s) {
     if (s.options_loaded || !profile_runtime::local_profile_store_ready()) return;
@@ -82,6 +93,54 @@ std::string ground_text(const std::optional<float> &ground) {
     return ground ? std::format("{:.1f}", *ground) : std::string("not found");
 }
 
+// The game's teleport manager (Engine/Game/Build/20260929/local_placements.h): its state, or
+// empty when it cannot be read. Its first uint32 is 0 while idle.
+std::optional<std::uint32_t> teleport_manager_state(std::uintptr_t base, std::uintptr_t *manager_out = nullptr) {
+    std::uintptr_t manager{};
+    std::uint32_t state{};
+    if (!memory::peek(base + addr::local_placements::teleport_manager, manager) || !manager || !memory::peek(manager, state))
+        return std::nullopt;
+    if (manager_out) *manager_out = manager;
+    return state;
+}
+
+// Logs what the teleport manager does: the game's respawns go through it, and a manager that
+// never goes idle again is what keeps a respawn loop alive.
+void watch_teleport_manager(Safety &s, std::uintptr_t base, std::uint64_t now) {
+    std::uintptr_t manager{};
+    const auto state = teleport_manager_state(base, &manager).value_or(0);
+    if (state != s.teleport_state) {
+        if (log_due(s.teleport_lines)) {
+            if (state && !s.teleport_state)
+                logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game's teleport manager is busy (state {}).", state);
+            else if (!state)
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Skater safety: the game's teleport manager is idle again after {} ms (was state {}).", now - s.teleport_busy_since,
+                             s.teleport_state);
+            else
+                logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game's teleport manager went from state {} to {}.",
+                             s.teleport_state, state);
+        }
+        if (state && !s.teleport_state) s.teleport_busy_since = now;
+        if (!state) s.teleport_dumped = s.teleport_wait_logged = false;
+        s.teleport_state = state;
+    }
+    // Busy for seconds: what the manager holds is the evidence for why it does not finish.
+    if (state && !s.teleport_dumped && now - s.teleport_busy_since >= stuck_teleport_ms) {
+        s.teleport_dumped = true;
+        std::array<std::uint32_t, 64> words{};
+        if (!memory::peek_bytes(manager, words.data(), sizeof(words))) return;
+        logging::log(logging::Level::warning, logging::Channel::skater,
+                     "Skater safety: the game's teleport manager has been busy (state {}) for {} ms. Its first 256 bytes follow.", state,
+                     now - s.teleport_busy_since);
+        for (std::size_t row = 0; row < words.size(); row += 16) {
+            std::string line;
+            for (std::size_t i = row; i < row + 16; ++i) line += std::format("{:08x} ", words[i]);
+            logging::log(logging::Level::warning, logging::Channel::skater, "Skater safety: teleport manager +0x{:03x}: {}", row * 4, line);
+        }
+    }
+}
+
 // Sends the local skater onto the ground at `where`. `trusted`: a last good grounded position,
 // whose own height may stand in when no ground is found (collision still streaming in).
 void send_to_ground(Safety &s, const Vec3 &where, bool trusted, const char *why, std::uint64_t now) {
@@ -90,6 +149,15 @@ void send_to_ground(Safety &s, const Vec3 &where, bool trusted, const char *why,
     if (multiplayer_session_active() && !session_noclip_allowed()) {
         logging::log(logging::Level::warning, logging::Channel::skater,
                      "Skater safety: {}; the host has turned off teleporting, so the skater is not moved.", why);
+        return;
+    }
+    // A busy teleport manager would only hold a new teleport until it is dropped.
+    if (s.teleport_state) {
+        if (!s.teleport_wait_logged)
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Skater safety: {}; the game's teleport manager is busy (state {}), so a teleport would never be sent.", why,
+                         s.teleport_state);
+        s.teleport_wait_logged = true;
         return;
     }
     const auto ground = ground_near(where);
@@ -111,6 +179,20 @@ void send_to_ground(Safety &s, const Vec3 &where, bool trusted, const char *why,
                  ground_text(ground), s.rescues, max_rescues);
 }
 
+// The moment a bound skater's transform stops being valid: what was wrong with it.
+void log_broken(Safety &s, const char *reason, const detail::SkaterRead &found, std::uint8_t teleport_flag) {
+    const auto &m = found.matrix;
+    const auto matrix = found.matrix_read
+        ? std::format("right ({:.3g}, {:.3g}, {:.3g}) up ({:.3g}, {:.3g}, {:.3g}) forward ({:.3g}, {:.3g}, {:.3g}) position ({:.3g}, {:.3g}, {:.3g})",
+                      m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], m[12], m[13], m[14])
+        : std::string("not readable");
+    logging::log(logging::Level::warning, logging::Channel::skater,
+                 "Skater safety: the bound skater's transform is not valid ({}): {}. Bodies: {} of 32 velocities not finite, fastest "
+                 "{:.1f} m/s, step {:.4g} s, board height {:.4g}; teleport flag {}, teleport manager state {} ({} so far on this map).",
+                 reason, matrix, s.nonfinite_bodies.load(), s.fastest.load(), s.seconds.load(), s.board_height.load(), teleport_flag,
+                 s.teleport_state, s.broken_lines);
+}
+
 void reset_map(Safety &s, const std::string &level) {
     s.level = level;
     s.player = s.component = 0;
@@ -119,11 +201,12 @@ void reset_map(Safety &s, const std::string &level) {
     s.healthy_since = 0;
     s.broken_since = 0;
     s.next_rescue = 0;
-    s.rescues = 0;
+    s.rescues = s.lost_lines = s.broken_lines = s.teleport_lines = 0;
     AcquireSRWLockExclusive(&s.loop_lock);
     s.loops.reset();
     s.rebuild_component = 0;
     ReleaseSRWLockExclusive(&s.loop_lock);
+    s.looping.store(false, std::memory_order_release);
 }
 
 void tick(Safety &s, std::uintptr_t client, const std::string &level) {
@@ -132,12 +215,20 @@ void tick(Safety &s, std::uintptr_t client, const std::string &level) {
     const auto base = s.base.load(std::memory_order_acquire);
     // The local skater: the player-bound entity, its root transform and its physics core.
     overlay::DebugModel skater;
-    std::uintptr_t bound{}, player{}, component{}, core{};
+    detail::SkaterRead found;
+    const char *broken_reason = nullptr;
     try {
-        (void)detail::debug_skater(base, client, skater, &bound);
+        (void)detail::debug_skater(base, client, skater, &found);
+    } catch (const detail::SourceGuard &guard) {
+        skater.skater_position_valid = false; // `found.entity` says whether the entity was there
+        broken_reason = guard.message;
     } catch (...) {
-        skater.skater_position_valid = false; // `bound` says whether the entity was there
+        skater.skater_position_valid = false;
+        broken_reason = "an unexpected error";
     }
+    const auto bound = found.entity;
+    std::uintptr_t player{}, component{}, core{};
+    std::uint8_t teleport_flag{};
     if (bound) {
         try {
             detail::SourceReader reader;
@@ -148,7 +239,8 @@ void tick(Safety &s, std::uintptr_t client, const std::string &level) {
             detail::source_require(reader.pointer(core) == base + addr::no_bail::bail_core_vtable, "Skater physics is unavailable.");
             // A teleport under way (fast travel, the trainer, a waypoint): the skater is moved on
             // purpose, and is neither lost nor put back while it lasts.
-            if (reader.value<std::uint8_t>(bound, 0x7e0)) s.teleport_until = now + 1000;
+            teleport_flag = reader.value<std::uint8_t>(bound, 0x7e0);
+            if (teleport_flag) s.teleport_until = now + 1000;
             reader.verify();
         } catch (...) {
             component = core = 0;
@@ -162,6 +254,7 @@ void tick(Safety &s, std::uintptr_t client, const std::string &level) {
     // A new map (or a new local player, which a level load makes): nothing from before applies.
     if (level != s.level || (player && s.player && player != s.player)) reset_map(s, level);
     if (player) s.player = player;
+    if (level_active) watch_teleport_manager(s, base, now);
 
     const float fastest = s.fastest.load(std::memory_order_relaxed);
     const auto zeroed = s.zeroed.load(std::memory_order_acquire), nonfinite = s.zeroed_nonfinite.load(std::memory_order_acquire);
@@ -198,12 +291,16 @@ void tick(Safety &s, std::uintptr_t client, const std::string &level) {
     }
     // What the skater was doing when it went: the evidence for why the game rebuilds it.
     if (s.present && !present) {
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Skater safety: local skater lost ({}) at ({:.1f}, {:.1f}, {:.1f}): physics state {}, fastest body {:.1f} m/s, ground below {}.",
-                     bound ? "its position is no longer valid" : "its entity is gone", s.last_position[0], s.last_position[1],
-                     s.last_position[2], s.last_state, s.last_fastest,
-                     level_active ? ground_text(ground_near(s.last_position)) : std::string("not looked for (level not active)"));
-        if (!bound && !teleporting && s.loop.load() && s.component) {
+        if (log_due(s.lost_lines))
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Skater safety: local skater lost ({}) at ({:.1f}, {:.1f}, {:.1f}): physics state {}, fastest body {:.1f} m/s, "
+                         "ground below {} ({} so far on this map).",
+                         bound ? "its transform is no longer valid" : "its entity is gone", s.last_position[0], s.last_position[1],
+                         s.last_position[2], s.last_state, s.last_fastest,
+                         level_active ? ground_text(ground_near(s.last_position)) : std::string("not looked for (level not active)"),
+                         s.lost_lines);
+        if (bound && log_due(s.broken_lines)) log_broken(s, broken_reason ? broken_reason : "position out of bounds", found, teleport_flag);
+        if (!bound && !teleporting && level_active && s.loop.load() && s.component) {
             AcquireSRWLockExclusive(&s.loop_lock);
             const bool fresh = s.rebuild_component != s.component;
             s.rebuild_component = s.component;
@@ -227,25 +324,29 @@ void tick(Safety &s, std::uintptr_t client, const std::string &level) {
         if (new_zeroed)
             logging::log(logging::Level::warning, logging::Channel::skater,
                          "Skater safety: the skater's physics went bad ({}); its velocities were zeroed{}.",
-                         new_nonfinite ? "a velocity that is not finite" : std::format("a body at {:.0f} m/s", fastest),
+                         new_nonfinite ? std::format("{} body velocities not finite", s.nonfinite_bodies.load())
+                                       : std::format("a body at {:.0f} m/s", fastest),
                          s.good.trusted ? "" : ", and there is no good grounded position on this map yet");
         const bool broken = s.broken_since && now - s.broken_since >= broken_for_ms;
         if ((new_zeroed || broken) && !teleporting && !respawning && s.good.trusted)
             send_to_ground(s, *s.good.trusted, true,
-                           new_zeroed ? "its physics went bad" : "the skater's position is not finite or out of bounds", now);
+                           new_zeroed ? "its physics went bad" : "the skater's transform is not valid", now);
     }
 
     bool ended{}, looping{};
     std::uint64_t forced{};
+    const bool stayed = s.healthy_since && now - s.healthy_since >= model::stable_ms;
     AcquireSRWLockExclusive(&s.loop_lock);
     ended = s.loops.settle(now, s.healthy_since);
     looping = s.loops.any_looping();
-    if (s.healthy_since && now - s.healthy_since >= model::stable_ms) s.rebuild_component = 0;
+    if (stayed) s.rebuild_component = 0;
     forced = s.forced;
     ReleaseSRWLockExclusive(&s.loop_lock);
+    s.looping.store(looping, std::memory_order_release);
     if (ended)
-        logging::log(logging::Level::success, logging::Channel::skater,
-                     "Loop breaker: the respawn loop is over ({} skater creations given the ground check so far).", forced);
+        logging::log(stayed ? logging::Level::success : logging::Level::warning, logging::Channel::skater, "Loop breaker: {} ({} skater "
+                     "creations given the ground check so far).", stayed ? "the respawn loop is over, the skater has stayed for 3 s"
+                     : "the game stopped re-creating the skater, but it has not come back valid", forced);
     // The skater showed up while the game is still looping: put it somewhere that holds.
     if (s.loop.load() && looping && present && !teleporting && level_active)
         send_to_ground(s, s.good.trusted ? *s.good.trusted : skater.skater_position, s.good.trusted.has_value(), "respawn loop", now);
@@ -256,10 +357,11 @@ std::string status_text(const Safety &s) {
                                                        (*s.good.trusted)[2])
                                          : std::string("none yet");
     return std::format("Skater safety: boost limits {} ({:.0f} m/s, {} physics steps), physics check {} ({:.0f} m/s), loop breaker {} "
-                       "(more than {} creations in {} s). Last good grounded position on this map: {}. Teleports used here: {} of {}.",
+                       "(more than {} creations in {} s). Last good grounded position on this map: {}. Teleports used here: {} of {}. "
+                       "Teleport manager state: {}.",
                        on_off(s.boost.load()), model::max_boost_speed, model::boost_steps, on_off(s.check.load()),
                        model::absurd_speed, on_off(s.loop.load()), model::loop_creates, model::loop_window_ms / 1000, position,
-                       s.rescues, max_rescues);
+                       s.rescues, max_rescues, s.teleport_state);
 }
 } // namespace
 
@@ -293,11 +395,13 @@ std::uint8_t creation_ground_check(std::uintptr_t component, std::uint8_t reques
     const bool force = requested == 0 && (looping || rebuild);
     const auto forced = force ? ++s.forced : s.forced;
     ReleaseSRWLockExclusive(&s.loop_lock);
-    if (started)
+    if (started) {
+        s.looping.store(true, std::memory_order_release);
         logging::log(logging::Level::warning, logging::Channel::skater,
                      "Loop breaker: skater component 0x{:x} was created more than {} times in {} s without a skater that stays "
                      "(the respawn loop); its creations get the game's ground check until one does.",
                      component, model::loop_creates, model::loop_window_ms / 1000);
+    }
     if (force && (forced <= 3 || forced % 10 == 0))
         logging::log(logging::Level::info, logging::Channel::skater, "Loop breaker: skater creation given the ground check ({}; {} so far).",
                      looping ? "respawn loop" : "rebuild after the skater was lost", forced);
@@ -312,15 +416,19 @@ PhysicsTarget physics_target() noexcept {
     const auto until = s.target_until;
     ReleaseSRWLockShared(&s.target_lock);
     const auto now = GetTickCount64();
-    if (now < s.last_creation.load(std::memory_order_acquire) + settle_after_ms) return {};
+    // Through a respawn loop the check keeps running: the game re-creates the skater every 533 ms.
+    if (!s.looping.load(std::memory_order_acquire) && now < s.last_creation.load(std::memory_order_acquire) + settle_after_ms) return {};
     return now < until ? target : PhysicsTarget{};
 }
 
-void report_physics(float fastest, bool zeroed, bool all_finite) noexcept {
+void report_physics(const PhysicsReport &report) noexcept {
     auto &s = safety();
-    s.fastest.store(fastest, std::memory_order_relaxed);
-    if (!zeroed) return;
-    if (!all_finite) s.zeroed_nonfinite.fetch_add(1, std::memory_order_release);
+    s.fastest.store(report.fastest, std::memory_order_relaxed);
+    s.seconds.store(report.seconds, std::memory_order_relaxed);
+    s.board_height.store(report.board_height, std::memory_order_relaxed);
+    s.nonfinite_bodies.store(report.nonfinite_bodies, std::memory_order_relaxed);
+    if (!report.zeroed) return;
+    if (!report.finite) s.zeroed_nonfinite.fetch_add(1, std::memory_order_release);
     s.zeroed.fetch_add(1, std::memory_order_release);
 }
 
