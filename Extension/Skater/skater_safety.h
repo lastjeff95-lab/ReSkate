@@ -20,10 +20,12 @@
 //          component created more than 3 times in 5 s, is given the game's ground check; while
 //          a loop lasts, the skater is sent to its last good grounded position (or onto the
 //          ground under where it appeared) when it shows up.
-//   rate   Offline, a game simulating physics below 60 Hz is raised to 60 Hz, the rate the SDK's
-//          tuning was measured at (Engine/Game/Settings/simulation_time.h). Under CrossOver the
-//          local skater was seen stepping at 30 Hz when its walking skeleton blew up to NaN. The
-//          game's own rate comes back in a multiplayer session or with `safety rate off`.
+//   rate   Offline, a game simulating below 60 Hz gets its own "Target Simulation: 60" profile
+//          (target_60_sim: ForceSimRate, MaxSimFps and DefaultSimFrequency 60, one physics
+//          substep), the rate the SDK's tuning was measured at. Under CrossOver the game rates the
+//          machine qualityminimum and picks target_30_sim, and the local skater's walking skeleton
+//          was seen blowing up to NaN at that 30 Hz step. Applied again if the game puts 30 back;
+//          the game's own settings come back in a multiplayer session or with `safety rate off`.
 // Teleports follow the host's noclip setting in a multiplayer session, like the trainer's.
 // Nothing here changes what is sent to other players.
 namespace dingosdk::skater_safety {

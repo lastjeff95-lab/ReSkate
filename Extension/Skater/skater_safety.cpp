@@ -12,6 +12,7 @@
 #include "Extension/Profile/local_profile_runtime.h"
 #include "Extension/Settings/named_settings.h"
 #include "Extension/Trainer/trainer_landing.h"
+#include <cctype>
 #include <charconv>
 #include <format>
 #include <utility>
@@ -22,9 +23,21 @@ namespace detail = client_source::detail;
 using model::Vec3;
 constexpr const char *boost_key = "Safety.BoostLimits", *check_key = "Safety.SkaterCheck", *loop_key = "Safety.LoopBreaker",
                      *rate_key = "Safety.SimRate60";
-// The simulation rate the SDK's own tuning was measured at (Engine/Game/Settings/simulation_time.h).
-constexpr const char *sim_rate = "SimulationTime.ForceSimRate", *max_sim_fps = "SimulationTime.MaxSimFps";
+// The game's own "Target Simulation: 60" (target_60_sim in its tier manager's options): the rate the
+// SDK's tuning was measured at (Engine/Game/Settings/simulation_time.h). The game's tier manager
+// picks target_30_sim on a machine it rates low (qualityminimum, as under CrossOver), whose
+// DefaultSimFrequency puts ForceSimRate back to 30 if only the rate is changed. Raising all of
+// them is the game's own 60 Hz option; one physics substep keeps the physics work the same.
 constexpr std::uint32_t wanted_rate = 60;
+struct SimSetting {
+    const char *name, *value;
+    bool required;
+};
+constexpr std::array<SimSetting, 5> sim_60{{{"SimulationTime.ForceSimRate", "60", true},
+                                             {"SimulationTime.MaxSimFps", "60", true},
+                                             {"ThreeLaneTimeRegulator.DefaultSimFrequency", "60", true},
+                                             {"Physics.SubstepCount", "1", false},
+                                             {"PerfOverlay.TargetSimIs60", "true", false}}};
 constexpr std::uint64_t rescue_gap_ms = 2000, settle_after_ms = 1000, broken_for_ms = 300, stuck_teleport_ms = 3000;
 constexpr int max_rescues = 10; // per map: past that the game is not fought any longer
 // Repeated lines (a loop repeats every 533 ms): the first few per map, then one in this many.
@@ -35,12 +48,13 @@ struct Safety {
     std::atomic<bool> started{};
     std::atomic<bool> boost{true}, check{true}, loop{true}, rate{true};
     bool options_loaded{};
-    // The simulation rate: what the game had when it was raised to `wanted_rate` (client tick only).
+    // The simulation rate: what the game had before sim_60 was applied (client tick only).
     struct SimRate {
-        bool rate_raised{}, max_raised{};
-        std::string found_rate, found_max, last_seen;
+        bool applied{};
+        std::array<std::optional<std::string>, sim_60.size()> found{};
+        std::string last_seen;
         float found_step{};
-        int lines{};
+        int lines{}, reapplied{};
         std::uint64_t next_look{};
     } sim;
     // Raw physics bodies for the log, one healthy and one broken per map (body_dump_wanted).
@@ -110,67 +124,86 @@ std::optional<float> number(const std::string &text) {
 }
 bool failed(const std::string &result) { return result.starts_with("error"); }
 
-// The game's simulation rate: logged when it changes, and raised to `wanted_rate` offline while
-// `rate` is on (the steps first, as Hall of Meat's slow motion does, then the live skater's own
-// step, which the game sets only when it builds a skater). Given back in a session or when off.
+// A setting's value against the one wanted, as the console prints them: numbers by value ("60",
+// "60.000000"), true/false also as 1/0.
+bool same_value(const std::string &have, std::string_view want) {
+    const auto lower = [](std::string_view text) {
+        std::string out(text);
+        for (auto &c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return out == "true" ? std::string("1") : out == "false" ? std::string("0") : out;
+    };
+    const auto a = lower(have), b = lower(want);
+    const auto x = number(a), y = number(b);
+    return x && y ? *x == *y : a == b;
+}
+
+// The game's simulation rate: logged when it changes, and set to the game's own 60 Hz profile
+// offline while `rate` is on (the steps first, as Hall of Meat's slow motion does, then the live
+// skater's own step, which the game sets only when it builds a skater). Applied again when the
+// game puts a value back; the found values come back in a session or when switched off.
 void update_sim_rate(Safety &s, std::uint64_t now) {
     if (now < s.sim.next_look) return;
     s.sim.next_look = now + 1000;
-    const auto rate_text = named_setting_value(sim_rate), max_text = named_setting_value(max_sim_fps);
-    if (!rate_text || !max_text) return;
+    std::array<std::optional<std::string>, sim_60.size()> have{};
+    for (std::size_t i = 0; i < sim_60.size(); ++i) have[i] = named_setting_value(sim_60[i].name);
+    if (!have[0] || !have[1] || !have[2]) return; // the settings are not readable yet
     const float step = hall_of_meat::step_length();
-    const auto seen = std::format("{}|{}|{:.5f}", *rate_text, *max_text, step);
+    std::string seen;
+    for (std::size_t i = 0; i < sim_60.size(); ++i) seen += std::format("{} {}, ", sim_60[i].name, have[i].value_or("?"));
+    seen += step > 0 ? std::format("skater step {:.5f} s ({} Hz)", step, simulation_time::rate_of(step)) : std::string("no skater");
     if (seen != s.sim.last_seen) {
         s.sim.last_seen = seen;
-        if (log_due(s.sim.lines)) logging::log(logging::Level::info, logging::Channel::skater,
-                     "Skater safety: the game's simulation is SimulationTime.ForceSimRate {}, MaxSimFps {}; the local skater steps {}.",
-                     *rate_text, *max_text,
-                     step > 0 ? std::format("{:.5f} s ({} Hz)", step, simulation_time::rate_of(step)) : std::string("(no skater)"));
+        if (log_due(s.sim.lines)) logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game's simulation: {}.", seen);
     }
-    const auto ours = std::to_string(wanted_rate);
     const bool wanted = s.rate.load() && !multiplayer_session_active();
-    if ((s.sim.rate_raised || s.sim.max_raised) && !wanted) {
+    if (s.sim.applied && !wanted) {
         // Only what still holds ours goes back: a value changed from elsewhere meanwhile stays.
-        if (s.sim.rate_raised && named_setting_value(sim_rate) == ours) (void)change_named_setting(sim_rate, s.sim.found_rate, false);
-        if (s.sim.max_raised && named_setting_value(max_sim_fps) == ours) (void)change_named_setting(max_sim_fps, s.sim.found_max, false);
+        for (std::size_t i = 0; i < sim_60.size(); ++i)
+            if (s.sim.found[i] && have[i] && same_value(*have[i], sim_60[i].value))
+                (void)change_named_setting(sim_60[i].name, *s.sim.found[i], false);
         if (s.sim.found_step > 0) (void)hall_of_meat::set_step_length(s.sim.found_step);
-        s.sim.rate_raised = s.sim.max_raised = false;
-        logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game's own simulation rate is back (ForceSimRate {}, "
-                     "MaxSimFps {}){}.", s.sim.found_rate, s.sim.found_max, multiplayer_session_active() ? " for the multiplayer session" : "");
+        s.sim.applied = false;
+        s.sim.found = {};
+        logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game's own simulation settings are back{}.",
+                     multiplayer_session_active() ? " for the multiplayer session" : "");
         return;
     }
-    if (!wanted || s.sim.rate_raised || s.sim.max_raised) return;
-    // Either setting below 60 holds the simulation below 60: only that one is raised.
-    const auto rate = number(*rate_text), max = number(*max_text);
-    const bool rate_low = rate && *rate < static_cast<float>(wanted_rate);
-    const bool max_low = max && *max > 0 && *max < static_cast<float>(wanted_rate);
-    if (!rate_low && !max_low) {
-        if (step > simulation_time::step_seconds(wanted_rate) * 1.5f) {
-            // The skater steps slowly although both settings allow 60: not ours to force.
-            logging::log(logging::Level::warning, logging::Channel::skater,
-                         "Skater safety: the local skater steps at {} Hz although ForceSimRate is {} and MaxSimFps {}; left as it is.",
-                         simulation_time::rate_of(step), *rate_text, *max_text);
-            s.sim.next_look = now + 60000;
+    if (!wanted) return;
+    // A game that already simulates at 60 or more is left alone.
+    if (!s.sim.applied) {
+        bool slow = false;
+        for (std::size_t i = 0; i < 3; ++i)
+            if (const auto value = number(*have[i]); value && *value > 0 && *value < static_cast<float>(wanted_rate)) slow = true;
+        if (!slow) return;
+    }
+    std::string changed;
+    bool missed = false;
+    for (std::size_t i = 0; i < sim_60.size(); ++i) {
+        if (!have[i] || same_value(*have[i], sim_60[i].value)) continue;
+        if (!s.sim.applied) s.sim.found[i] = have[i];
+        if (failed(change_named_setting(sim_60[i].name, sim_60[i].value, false))) {
+            missed = missed || sim_60[i].required;
+            continue;
         }
+        changed += std::format("{}{} {} -> {}", changed.empty() ? "" : ", ", sim_60[i].name, *have[i], sim_60[i].value);
+    }
+    if (changed.empty()) {
+        if (missed) s.sim.next_look = now + 60000;
         return;
     }
-    s.sim.found_rate = *rate_text;
-    s.sim.found_max = *max_text;
-    s.sim.found_step = step;
-    s.sim.rate_raised = rate_low && !failed(change_named_setting(sim_rate, ours, false));
-    s.sim.max_raised = max_low && !failed(change_named_setting(max_sim_fps, ours, false));
-    if ((rate_low && !s.sim.rate_raised) || (max_low && !s.sim.max_raised)) {
-        logging::log(logging::Level::warning, logging::Channel::skater,
-                     "Skater safety: could not raise the simulation to {} Hz (ForceSimRate {}, MaxSimFps {}).", wanted_rate, *rate_text, *max_text);
-        s.sim.next_look = now + 60000;
-        if (!s.sim.rate_raised && !s.sim.max_raised) return;
-    }
+    const bool first = !s.sim.applied;
+    if (first) s.sim.found_step = step;
+    s.sim.applied = true;
     const bool skater = hall_of_meat::set_step_length(simulation_time::step_seconds(wanted_rate));
-    logging::log(logging::Level::warning, logging::Channel::skater,
-                 "Skater safety: the game held physics below {} Hz (ForceSimRate {}, MaxSimFps {}; skater step {}); raised to {} Hz{}. "
-                 "`safety rate off` gives the game its own rate back.",
-                 wanted_rate, *rate_text, *max_text, step > 0 ? std::format("{:.5f} s", step) : std::string("not read yet"), wanted_rate,
-                 skater ? ", and the local skater steps at it now" : "; skaters built from now on step at it");
+    if (first)
+        logging::log(logging::Level::warning, logging::Channel::skater,
+                     "Skater safety: the game simulated below 60 Hz (its \"Target Simulation\" was 30); applied its own 60 Hz profile: {}{}{}. "
+                     "`safety rate off` gives the game its own settings back.",
+                     changed, skater ? "; the local skater steps at 60 Hz now" : "; skaters built from now on step at 60 Hz",
+                     missed ? "; a required setting could not be changed" : "");
+    else if (log_due(s.sim.reapplied))
+        logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game put its 30 Hz settings back; 60 Hz again: {} ({} times).",
+                     changed, s.sim.reapplied);
 }
 
 void log_body_dump(const BodyDump &dump) {
@@ -474,7 +507,7 @@ std::string status_text(const Safety &s) {
                        "here: {} of {}. Teleport manager state: {}.",
                        on_off(s.boost.load()), model::max_boost_speed, model::boost_steps, on_off(s.check.load()),
                        model::absurd_speed, on_off(s.loop.load()), model::loop_creates, model::loop_window_ms / 1000, on_off(s.rate.load()),
-                       (s.sim.rate_raised || s.sim.max_raised) ? std::format(" (raised from ForceSimRate {}, MaxSimFps {})", s.sim.found_rate, s.sim.found_max) : std::string(), position, s.rescues, max_rescues,
+                       s.sim.applied ? std::string(" (applied)") : std::string(), position, s.rescues, max_rescues,
                        s.teleport_state);
 }
 } // namespace
