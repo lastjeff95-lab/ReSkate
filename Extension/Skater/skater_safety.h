@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -19,6 +20,10 @@
 //          component created more than 3 times in 5 s, is given the game's ground check; while
 //          a loop lasts, the skater is sent to its last good grounded position (or onto the
 //          ground under where it appeared) when it shows up.
+//   rate   Offline, a game simulating physics below 60 Hz is raised to 60 Hz, the rate the SDK's
+//          tuning was measured at (Engine/Game/Settings/simulation_time.h). Under CrossOver the
+//          local skater was seen stepping at 30 Hz when its walking skeleton blew up to NaN. The
+//          game's own rate comes back in a multiplayer session or with `safety rate off`.
 // Teleports follow the host's noclip setting in a multiplayer session, like the trainer's.
 // Nothing here changes what is sent to other players.
 namespace dingosdk::skater_safety {
@@ -42,7 +47,16 @@ struct PhysicsReport {
     int nonfinite_bodies{};
 };
 void report_physics(const PhysicsReport &report) noexcept;
+// Raw physics bodies (0x130 bytes each) for the log: the first board body and the first skeleton
+// body, once healthy and once broken per map. Only a body's velocity (+0x70) and flags (+0x60) are
+// mapped; these show where the rest (its position) lives.
+struct BodyDump {
+    bool broken{};
+    std::array<std::uint32_t, 76> board{}, rig{};
+};
+bool body_dump_wanted(bool broken) noexcept;
+void report_body_dump(const BodyDump &dump) noexcept;
 bool boost_limits() noexcept;
-// The console verb: safety [status] | safety boost|check|loop on|off.
+// The console verb: safety [status] | safety boost|check|loop|rate on|off.
 std::string command(const std::vector<std::string> &words);
 } // namespace dingosdk::skater_safety

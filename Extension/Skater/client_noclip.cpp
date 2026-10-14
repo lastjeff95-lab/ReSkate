@@ -400,7 +400,15 @@ void safety_check_step(std::uintptr_t core) noexcept {
         const auto check = skater_safety::model::check_bodies(velocities);
         skater_safety::PhysicsReport report{check.fastest, check.finite, false, bodies.seconds, bodies.board_height};
         for (const auto& v : velocities) report.nonfinite_bodies += skater_safety::model::finite(v) ? 0 : 1;
-        if (!skater_safety::model::sane(check)) {
+        const bool broken = !skater_safety::model::sane(check);
+        if (skater_safety::body_dump_wanted(broken)) {
+            // Before anything is zeroed: the bodies as the game left them.
+            skater_safety::BodyDump dump{broken};
+            if (memory::peek_bytes(bodies.parts[0], dump.board.data(), sizeof(dump.board)) &&
+                memory::peek_bytes(bodies.parts[9], dump.rig.data(), sizeof(dump.rig)))
+                skater_safety::report_body_dump(dump);
+        }
+        if (broken) {
             // Like the native velocity writers: XYZ at +70 and the dirty bit 8 at +60.
             for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
                 body_write(bodies.parts[i] + 0x70, std::array<float, 3>{});

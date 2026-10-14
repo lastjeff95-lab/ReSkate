@@ -7,15 +7,24 @@
 #include "Engine/Game/Build/20260929/local_placements.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Multiplayer/session_tools.h"
+#include "Engine/Game/Settings/simulation_time.h"
+#include "Extension/HallOfMeat/hall_of_meat_skater.h"
 #include "Extension/Profile/local_profile_runtime.h"
+#include "Extension/Settings/named_settings.h"
 #include "Extension/Trainer/trainer_landing.h"
+#include <charconv>
 #include <format>
+#include <utility>
 
 namespace dingosdk::skater_safety {
 namespace {
 namespace detail = client_source::detail;
 using model::Vec3;
-constexpr const char *boost_key = "Safety.BoostLimits", *check_key = "Safety.SkaterCheck", *loop_key = "Safety.LoopBreaker";
+constexpr const char *boost_key = "Safety.BoostLimits", *check_key = "Safety.SkaterCheck", *loop_key = "Safety.LoopBreaker",
+                     *rate_key = "Safety.SimRate60";
+// The simulation rate the SDK's own tuning was measured at (Engine/Game/Settings/simulation_time.h).
+constexpr const char *sim_rate = "SimulationTime.ForceSimRate", *max_sim_fps = "SimulationTime.MaxSimFps";
+constexpr std::uint32_t wanted_rate = 60;
 constexpr std::uint64_t rescue_gap_ms = 2000, settle_after_ms = 1000, broken_for_ms = 300, stuck_teleport_ms = 3000;
 constexpr int max_rescues = 10; // per map: past that the game is not fought any longer
 // Repeated lines (a loop repeats every 533 ms): the first few per map, then one in this many.
@@ -24,8 +33,20 @@ constexpr int log_first = 5, log_every = 20;
 struct Safety {
     std::atomic<std::uintptr_t> base{};
     std::atomic<bool> started{};
-    std::atomic<bool> boost{true}, check{true}, loop{true};
+    std::atomic<bool> boost{true}, check{true}, loop{true}, rate{true};
     bool options_loaded{};
+    // The simulation rate: what the game had when it was raised to `wanted_rate` (client tick only).
+    struct SimRate {
+        bool rate_raised{}, max_raised{};
+        std::string found_rate, found_max, last_seen;
+        float found_step{};
+        int lines{};
+        std::uint64_t next_look{};
+    } sim;
+    // Raw physics bodies for the log, one healthy and one broken per map (body_dump_wanted).
+    std::atomic<bool> healthy_dumped{}, broken_dumped{};
+    SRWLOCK dump_lock = SRWLOCK_INIT;
+    std::optional<BodyDump> dump;
     // Written by the client tick, read on every physics step.
     SRWLOCK target_lock = SRWLOCK_INIT;
     PhysicsTarget target;
@@ -74,10 +95,95 @@ void load_options(Safety &s) {
     s.boost.store(profile_runtime::local_preference(boost_key).value_or(true));
     s.check.store(profile_runtime::local_preference(check_key).value_or(true));
     s.loop.store(profile_runtime::local_preference(loop_key).value_or(true));
-    if (!s.boost.load() || !s.check.load() || !s.loop.load())
+    s.rate.store(profile_runtime::local_preference(rate_key).value_or(true));
+    if (!s.boost.load() || !s.check.load() || !s.loop.load() || !s.rate.load())
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Skater safety from your profile: boost limits {}, physics check {}, loop breaker {}.",
-                     on_off(s.boost.load()), on_off(s.check.load()), on_off(s.loop.load()));
+                     "Skater safety from your profile: boost limits {}, physics check {}, loop breaker {}, 60 Hz physics {}.",
+                     on_off(s.boost.load()), on_off(s.check.load()), on_off(s.loop.load()), on_off(s.rate.load()));
+}
+
+std::optional<float> number(const std::string &text) {
+    float value{};
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || !std::isfinite(value)) return std::nullopt;
+    return value;
+}
+bool failed(const std::string &result) { return result.starts_with("error"); }
+
+// The game's simulation rate: logged when it changes, and raised to `wanted_rate` offline while
+// `rate` is on (the steps first, as Hall of Meat's slow motion does, then the live skater's own
+// step, which the game sets only when it builds a skater). Given back in a session or when off.
+void update_sim_rate(Safety &s, std::uint64_t now) {
+    if (now < s.sim.next_look) return;
+    s.sim.next_look = now + 1000;
+    const auto rate_text = named_setting_value(sim_rate), max_text = named_setting_value(max_sim_fps);
+    if (!rate_text || !max_text) return;
+    const float step = hall_of_meat::step_length();
+    const auto seen = std::format("{}|{}|{:.5f}", *rate_text, *max_text, step);
+    if (seen != s.sim.last_seen) {
+        s.sim.last_seen = seen;
+        if (log_due(s.sim.lines)) logging::log(logging::Level::info, logging::Channel::skater,
+                     "Skater safety: the game's simulation is SimulationTime.ForceSimRate {}, MaxSimFps {}; the local skater steps {}.",
+                     *rate_text, *max_text,
+                     step > 0 ? std::format("{:.5f} s ({} Hz)", step, simulation_time::rate_of(step)) : std::string("(no skater)"));
+    }
+    const auto ours = std::to_string(wanted_rate);
+    const bool wanted = s.rate.load() && !multiplayer_session_active();
+    if ((s.sim.rate_raised || s.sim.max_raised) && !wanted) {
+        // Only what still holds ours goes back: a value changed from elsewhere meanwhile stays.
+        if (s.sim.rate_raised && named_setting_value(sim_rate) == ours) (void)change_named_setting(sim_rate, s.sim.found_rate, false);
+        if (s.sim.max_raised && named_setting_value(max_sim_fps) == ours) (void)change_named_setting(max_sim_fps, s.sim.found_max, false);
+        if (s.sim.found_step > 0) (void)hall_of_meat::set_step_length(s.sim.found_step);
+        s.sim.rate_raised = s.sim.max_raised = false;
+        logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: the game's own simulation rate is back (ForceSimRate {}, "
+                     "MaxSimFps {}){}.", s.sim.found_rate, s.sim.found_max, multiplayer_session_active() ? " for the multiplayer session" : "");
+        return;
+    }
+    if (!wanted || s.sim.rate_raised || s.sim.max_raised) return;
+    // Either setting below 60 holds the simulation below 60: only that one is raised.
+    const auto rate = number(*rate_text), max = number(*max_text);
+    const bool rate_low = rate && *rate < static_cast<float>(wanted_rate);
+    const bool max_low = max && *max > 0 && *max < static_cast<float>(wanted_rate);
+    if (!rate_low && !max_low) {
+        if (step > simulation_time::step_seconds(wanted_rate) * 1.5f) {
+            // The skater steps slowly although both settings allow 60: not ours to force.
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Skater safety: the local skater steps at {} Hz although ForceSimRate is {} and MaxSimFps {}; left as it is.",
+                         simulation_time::rate_of(step), *rate_text, *max_text);
+            s.sim.next_look = now + 60000;
+        }
+        return;
+    }
+    s.sim.found_rate = *rate_text;
+    s.sim.found_max = *max_text;
+    s.sim.found_step = step;
+    s.sim.rate_raised = rate_low && !failed(change_named_setting(sim_rate, ours, false));
+    s.sim.max_raised = max_low && !failed(change_named_setting(max_sim_fps, ours, false));
+    if ((rate_low && !s.sim.rate_raised) || (max_low && !s.sim.max_raised)) {
+        logging::log(logging::Level::warning, logging::Channel::skater,
+                     "Skater safety: could not raise the simulation to {} Hz (ForceSimRate {}, MaxSimFps {}).", wanted_rate, *rate_text, *max_text);
+        s.sim.next_look = now + 60000;
+        if (!s.sim.rate_raised && !s.sim.max_raised) return;
+    }
+    const bool skater = hall_of_meat::set_step_length(simulation_time::step_seconds(wanted_rate));
+    logging::log(logging::Level::warning, logging::Channel::skater,
+                 "Skater safety: the game held physics below {} Hz (ForceSimRate {}, MaxSimFps {}; skater step {}); raised to {} Hz{}. "
+                 "`safety rate off` gives the game its own rate back.",
+                 wanted_rate, *rate_text, *max_text, step > 0 ? std::format("{:.5f} s", step) : std::string("not read yet"), wanted_rate,
+                 skater ? ", and the local skater steps at it now" : "; skaters built from now on step at it");
+}
+
+void log_body_dump(const BodyDump &dump) {
+    const auto lines = [&](const char *which, const std::array<std::uint32_t, 76> &words) {
+        for (std::size_t row = 0; row < words.size(); row += 16) {
+            std::string line;
+            for (std::size_t i = row; i < std::min(row + 16, words.size()); ++i) line += std::format("{:08x} ", words[i]);
+            logging::log(logging::Level::info, logging::Channel::skater, "Skater safety: {} {} body +0x{:03x}: {}",
+                         dump.broken ? "broken" : "healthy", which, row * 4, line);
+        }
+    };
+    lines("board", dump.board);
+    lines("skeleton", dump.rig);
 }
 
 // The surface under a point: first the floor just below it (a start point under a roof or a
@@ -202,6 +308,8 @@ void reset_map(Safety &s, const std::string &level) {
     s.broken_since = 0;
     s.next_rescue = 0;
     s.rescues = s.lost_lines = s.broken_lines = s.teleport_lines = 0;
+    s.healthy_dumped.store(false, std::memory_order_release);
+    s.broken_dumped.store(false, std::memory_order_release);
     AcquireSRWLockExclusive(&s.loop_lock);
     s.loops.reset();
     s.rebuild_component = 0;
@@ -255,6 +363,11 @@ void tick(Safety &s, std::uintptr_t client, const std::string &level) {
     if (level != s.level || (player && s.player && player != s.player)) reset_map(s, level);
     if (player) s.player = player;
     if (level_active) watch_teleport_manager(s, base, now);
+    update_sim_rate(s, now);
+    AcquireSRWLockExclusive(&s.dump_lock);
+    auto dump = std::exchange(s.dump, std::nullopt);
+    ReleaseSRWLockExclusive(&s.dump_lock);
+    if (dump) log_body_dump(*dump);
 
     const float fastest = s.fastest.load(std::memory_order_relaxed);
     const auto zeroed = s.zeroed.load(std::memory_order_acquire), nonfinite = s.zeroed_nonfinite.load(std::memory_order_acquire);
@@ -357,11 +470,12 @@ std::string status_text(const Safety &s) {
                                                        (*s.good.trusted)[2])
                                          : std::string("none yet");
     return std::format("Skater safety: boost limits {} ({:.0f} m/s, {} physics steps), physics check {} ({:.0f} m/s), loop breaker {} "
-                       "(more than {} creations in {} s). Last good grounded position on this map: {}. Teleports used here: {} of {}. "
-                       "Teleport manager state: {}.",
+                       "(more than {} creations in {} s), 60 Hz physics {}{}. Last good grounded position on this map: {}. Teleports used "
+                       "here: {} of {}. Teleport manager state: {}.",
                        on_off(s.boost.load()), model::max_boost_speed, model::boost_steps, on_off(s.check.load()),
-                       model::absurd_speed, on_off(s.loop.load()), model::loop_creates, model::loop_window_ms / 1000, position,
-                       s.rescues, max_rescues, s.teleport_state);
+                       model::absurd_speed, on_off(s.loop.load()), model::loop_creates, model::loop_window_ms / 1000, on_off(s.rate.load()),
+                       (s.sim.rate_raised || s.sim.max_raised) ? std::format(" (raised from ForceSimRate {}, MaxSimFps {})", s.sim.found_rate, s.sim.found_max) : std::string(), position, s.rescues, max_rescues,
+                       s.teleport_state);
 }
 } // namespace
 
@@ -437,14 +551,31 @@ bool boost_limits() noexcept {
     return s.started.load(std::memory_order_acquire) && s.boost.load(std::memory_order_acquire);
 }
 
+bool body_dump_wanted(bool broken) noexcept {
+    auto &s = safety();
+    return s.started.load(std::memory_order_acquire) && !(broken ? s.broken_dumped : s.healthy_dumped).load(std::memory_order_acquire);
+}
+
+void report_body_dump(const BodyDump &dump) noexcept {
+    auto &s = safety();
+    if ((dump.broken ? s.broken_dumped : s.healthy_dumped).exchange(true, std::memory_order_acq_rel)) return;
+    AcquireSRWLockExclusive(&s.dump_lock);
+    s.dump = dump;
+    ReleaseSRWLockExclusive(&s.dump_lock);
+}
+
 std::string command(const std::vector<std::string> &words) {
     auto &s = safety();
     const auto verb = words.empty() ? std::string("status") : words[0];
     if (verb == "status") return status_text(s);
-    std::atomic<bool> *option = verb == "boost" ? &s.boost : verb == "check" ? &s.check : verb == "loop" ? &s.loop : nullptr;
-    const char *key = verb == "boost" ? boost_key : verb == "check" ? check_key : loop_key;
+    std::atomic<bool> *option = verb == "boost" ? &s.boost
+                               : verb == "check" ? &s.check
+                               : verb == "loop"  ? &s.loop
+                               : verb == "rate"  ? &s.rate
+                                                 : nullptr;
+    const char *key = verb == "boost" ? boost_key : verb == "check" ? check_key : verb == "loop" ? loop_key : rate_key;
     if (!option || words.size() < 2 || (words[1] != "on" && words[1] != "off"))
-        return "error: usage: safety [status] | safety boost|check|loop on|off";
+        return "error: usage: safety [status] | safety boost|check|loop|rate on|off";
     const bool on = words[1] == "on";
     option->store(on, std::memory_order_release);
     profile_runtime::set_local_preference(key, on);
