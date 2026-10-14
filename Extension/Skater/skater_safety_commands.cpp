@@ -5,10 +5,10 @@
 namespace dingosdk::console {
 void register_skater_safety_commands(Commands &registry) {
     std::vector<Argument> arguments;
-    auto rest = argument("boost|check|loop|rate on|off", Type::text, true);
+    auto rest = argument("boost|check|loop on|off", Type::text, true);
     rest.rest = true;
     arguments.push_back(std::move(rest));
-    auto entry = action("safety", "Skater safety: boost limits, the physics check, the respawn loop breaker and 60 Hz physics (kept)",
+    auto entry = action("safety", "Skater safety: boost limits, the physics check and the respawn loop breaker (kept)",
                         Group::gameplay, std::move(arguments));
     entry.run = [](const Model &, const Values &values, const Output &out) {
         std::vector<std::string> split;

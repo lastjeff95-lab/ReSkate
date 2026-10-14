@@ -189,6 +189,7 @@ struct NoclipBodies {
     float seconds{}, board_height{};
     bool offboard{};
     bool wipeout{}; // Spread-eagle/torpedo use the native wipeout physics path.
+    std::uint32_t state{}; // the committed physics state (context +0x1414)
     std::array<float, 3> root{}; // Entity root: the camera target and the idle motion target.
     std::array<std::uintptr_t, 32> parts{}; // Board 0..8, native skeleton velocity parts 1..23.
 };

@@ -20,12 +20,6 @@
 //          component created more than 3 times in 5 s, is given the game's ground check; while
 //          a loop lasts, the skater is sent to its last good grounded position (or onto the
 //          ground under where it appeared) when it shows up.
-//   rate   Offline, a game simulating below 60 Hz gets its own "Target Simulation: 60" profile
-//          (target_60_sim: ForceSimRate, MaxSimFps and DefaultSimFrequency 60, one physics
-//          substep), the rate the SDK's tuning was measured at. Under CrossOver the game rates the
-//          machine qualityminimum and picks target_30_sim, and the local skater's walking skeleton
-//          was seen blowing up to NaN at that 30 Hz step. Applied again if the game puts 30 back;
-//          the game's own settings come back in a multiplayer session or with `safety rate off`.
 // Teleports follow the host's noclip setting in a multiplayer session, like the trainer's.
 // Nothing here changes what is sent to other players.
 namespace dingosdk::skater_safety {
@@ -58,7 +52,20 @@ struct BodyDump {
 };
 bool body_dump_wanted(bool broken) noexcept;
 void report_body_dump(const BodyDump &dump) noexcept;
+// One physics step of the local skater (client_noclip.cpp, every step the check runs). The last 32
+// are logged once per map when its physics first breaks: what led up to it.
+struct StepSample {
+    std::uint64_t at{};    // GetTickCount64
+    std::uint32_t state{}; // the committed physics state: 100s ride, 300 wipeout, 504 off the board
+    float seconds{}, fastest{};
+    int nonfinite_bodies{};
+    std::array<float, 3> board_position{}, board_velocity{}, skeleton_position{}, skeleton_velocity{};
+};
+void record_step(const StepSample &sample, bool broken) noexcept;
+// The motion target the game hands the local skater's off-board skeleton drive (a spread-eagle,
+// torpedo or walking skater), from the motion hook; kept with the steps above.
+void note_motion_target(const std::array<float, 16> &target) noexcept;
 bool boost_limits() noexcept;
-// The console verb: safety [status] | safety boost|check|loop|rate on|off.
+// The console verb: safety [status] | safety boost|check|loop on|off.
 std::string command(const std::vector<std::string> &words);
 } // namespace dingosdk::skater_safety

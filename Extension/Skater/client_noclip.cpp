@@ -87,6 +87,7 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
     // Read the committed native state, not the selector's proposed next state
     // (which is remapped by its caller and may be stale between selections).
     const auto physics = reader.value<std::uint32_t>(result.context, 0x1414);
+    result.state = physics;
     result.wipeout = physics == addr::no_bail::wipeout_physics_state ||
         physics == addr::no_bail::offboard_physics_state;
     source_require(reader.pointer(board) == base + spawn::board_physics_vtable && reader.pointer(rig) == base + spawn::rig_physics_vtable,
@@ -396,11 +397,16 @@ void safety_check_step(std::uintptr_t core) noexcept {
             velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
             flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
         }
+        // A body's world position is at +0x50 (read from raw dumps against the skater's root).
+        const auto board_position = reader.value<std::array<float, 3>>(bodies.parts[0], 0x50);
+        const auto skeleton_position = reader.value<std::array<float, 3>>(bodies.parts[9], 0x50);
         reader.verify();
         const auto check = skater_safety::model::check_bodies(velocities);
         skater_safety::PhysicsReport report{check.fastest, check.finite, false, bodies.seconds, bodies.board_height};
         for (const auto& v : velocities) report.nonfinite_bodies += skater_safety::model::finite(v) ? 0 : 1;
         const bool broken = !skater_safety::model::sane(check);
+        skater_safety::record_step({GetTickCount64(), bodies.state, bodies.seconds, check.fastest, report.nonfinite_bodies,
+            board_position, velocities[0], skeleton_position, velocities[9]}, broken);
         if (skater_safety::body_dump_wanted(broken)) {
             // Before anything is zeroed: the bodies as the game left them.
             skater_safety::BodyDump dump{broken};
@@ -505,8 +511,19 @@ bool noclip_motion_target(std::uintptr_t rig, std::uintptr_t context,
       catch (...) { debug_stop_noclip(debug); debug.status = "Flight stopped after a motion error."; }
     return false;
 }
+// Skater safety's step history (skater_safety.h): the target the game drives the local skater's
+// off-board skeleton toward, as it hands it over.
+void safety_note_motion(std::uintptr_t rig, const std::array<float,16>* supplied) noexcept {
+    const auto local = skater_safety::physics_target();
+    std::uintptr_t wrapper{};
+    if (!supplied || !local.core || !memory::peek(local.core + 0x438, wrapper) || wrapper != rig) return;
+    std::array<float, 16> matrix{};
+    if (memory::peek_bytes(reinterpret_cast<std::uintptr_t>(supplied), matrix.data(), sizeof(matrix)))
+        skater_safety::note_motion_target(matrix);
+}
 void noclip_skater_motion(std::uintptr_t rig, std::uintptr_t context,
     const std::array<float,16>* supplied, std::uint8_t flags) {
+    safety_note_motion(rig, supplied);
     const auto original = source_state().motion_original.load(std::memory_order_acquire);
     alignas(16) std::array<float,16> target{};
     const auto* motion = noclip_motion_target(rig, context, supplied, target) ? &target : supplied;
