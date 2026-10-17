@@ -1,4 +1,5 @@
 #include "world_model.h"
+#include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/supported_build.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/world_model.h"
@@ -9,11 +10,17 @@
 namespace dingosdk {
 namespace {
 constexpr std::uintptr_t highest = 0x00007fffffffffffULL;
+// This process's memory goes through memory::read_bytes, a plain copy under Wine (see memory.h:
+// this description is read twice a second on the game's update thread).
+bool read_process(HANDLE process, std::uintptr_t address, void* destination, std::size_t size) {
+    if (process == GetCurrentProcess()) return memory::read_bytes(address, destination, size);
+    SIZE_T count{};
+    return ReadProcessMemory(process, reinterpret_cast<const void*>(address), destination, size, &count) &&
+        count == size;
+}
 template<class T> bool read(HANDLE process, std::uintptr_t address, T& value) {
     if (address < 0x10000 || address > highest - sizeof(value)) return false;
-    SIZE_T count{};
-    return ReadProcessMemory(process, reinterpret_cast<const void*>(address), &value,
-                             sizeof(value), &count) && count == sizeof(value);
+    return read_process(process, address, &value, sizeof(value));
 }
 std::string lower(std::string value) {
     for (auto& c : value) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
@@ -35,9 +42,7 @@ bool name(HANDLE process, std::uintptr_t address, std::string& value, bool asset
         // directly, and reject incomplete reads before examining the buffer.
         const auto current = address + offset;
         const auto size = std::min(buffer.size() - offset, page_size - current % page_size);
-        SIZE_T copied{};
-        if (!ReadProcessMemory(process, reinterpret_cast<const void*>(current), buffer.data(), size, &copied) ||
-            copied != size) return false;
+        if (!read_process(process, current, buffer.data(), size)) return false;
         for (std::size_t i = 0; i < size; ++i) {
             const char c = buffer[i];
             if (!c) return !asset || value.empty() ||
