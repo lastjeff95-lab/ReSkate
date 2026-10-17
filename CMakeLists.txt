@@ -280,6 +280,13 @@ if(DINGOSDK_BUILD_TESTS AND EXISTS "${PROJECT_SOURCE_DIR}/tests/logging_tests.cp
     target_link_libraries(dingosdk_logging_tests PRIVATE dingosdk_logging)
     add_test(NAME logging_regressions COMMAND dingosdk_logging_tests)
 endif()
+option(DINGOSDK_BUILD_MEMORY_TESTS "Build the in-process memory read tests (memory.h)" OFF)
+if(DINGOSDK_BUILD_MEMORY_TESTS AND WIN32)
+    enable_testing()
+    add_executable(dingosdk_memory_read_tests Engine/Core/Platform/Test/memory_read_tests.cpp)
+    dingosdk_configure_target(dingosdk_memory_read_tests)
+    add_test(NAME memory_reads COMMAND dingosdk_memory_read_tests)
+endif()
 
 # Header-only game contracts belong to the runtime's subsystem tree.
 if(WIN32)
