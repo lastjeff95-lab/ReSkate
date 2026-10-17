@@ -29,22 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache cargo (Spotify device helper)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            SpotifyHelper/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('SpotifyHelper/Cargo.lock') }}
-
-      # cmake/Runtime.cmake links the Rust helper when cargo is found and globs the
-      # windows_x86_64_msvc import library from the cargo registry at configure time, so the
-      # crates must be on disk before CMake configures.
-      - name: Build Spotify device helper
-        working-directory: SpotifyHelper
-        run: cargo build --release --lib --locked
-
       - name: Configure
         run: >
           cmake --preset vs2022-x64
