@@ -675,21 +675,26 @@ void upload_card_image(State& s) {
     if (const auto id = upload_image(s, pixels, 1, s.card_texture, s.card_upload)) card_image_uploaded(id, pixels.serial);
 }
 
-// The menu's map pictures (menu_map_pictures.cpp), when a new set is waiting.
+// The menu's map pictures (menu_map_pictures.cpp), when a new set is waiting. As for the card
+// icon: the GPU is waited on only when there is a picture to upload. Waiting first, on every
+// presentation once the texture existed, kept the game's next frame from starting until the GPU
+// had finished the last one: on a Mac (D3DMetal) GPU 8 ms a frame but 30-40 fps, and
+// "present/overlay" at 18 ms a frame.
 void upload_menu_map_image(State& s) {
     if (!s.device || !s.srvs) return;
-    if (s.menu_map_texture && s.next_fence && !completed(s.next_fence, render_fence_timeout_ms)) return;
     CardPixels pixels;
     if (!take_menu_map_pixels(pixels) || pixels.rgba.empty()) return;
+    if (s.menu_map_texture && s.next_fence && !completed(s.next_fence, render_fence_timeout_ms)) return;
     if (const auto id = upload_image(s, pixels, 2, s.menu_map_texture, s.menu_map_upload)) menu_map_pixels_uploaded(id, pixels.serial);
 }
 
-// The item card's mod icon (item_browser_overlay.cpp), when another is waiting.
+// The item card's mod icon (item_browser_overlay.cpp), when another is waiting; the GPU is waited
+// on only then, as above.
 void upload_mod_icon(State& s) {
     if (!s.device || !s.srvs) return;
-    if (s.mod_icon_texture && s.next_fence && !completed(s.next_fence, render_fence_timeout_ms)) return;
     CardPixels pixels;
     if (!take_mod_icon_pixels(pixels) || pixels.rgba.empty()) return;
+    if (s.mod_icon_texture && s.next_fence && !completed(s.next_fence, render_fence_timeout_ms)) return;
     if (const auto id = upload_image(s, pixels, 3, s.mod_icon_texture, s.mod_icon_upload)) mod_icon_uploaded(id, pixels.serial);
 }
 
